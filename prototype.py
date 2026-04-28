@@ -1,21 +1,54 @@
 import os
+import json
 import subprocess
 import platform
 import chromadb
-import google.generativeai as genai
+from huggingface_hub import InferenceClient
+from dotenv import load_dotenv
 
-# Setup Gemini API
-api_key = os.getenv("GEMINI_API_KEY")
+# Load environment variables from .env file
+load_dotenv()
 
+# Setup Hugging Face API
+hf_token = os.getenv("HF_TOKEN")
+if not hf_token:
+    print("WARNING: HF_TOKEN not found in .env. Please add it to use the Hugging Face API.")
 
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-2.5-flash')
+# We use a powerful open-source coding model.
+# Other great options: "meta-llama/Meta-Llama-3-8B-Instruct", "mistralai/Mixtral-8x7B-Instruct-v0.1"
+MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct" 
+client = InferenceClient(model=MODEL_ID, token=hf_token)
 
-# Setup ChromaDB for RAG (Command History)
-# This will create a 'chroma_db' folder in the current directory to persist history.
+# Setup ChromaDB for RAG (Git Command History)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
-# Using Chroma's default embedding function
-collection = chroma_client.get_or_create_collection(name="command_history")
+collection = chroma_client.get_or_create_collection(name="bash_command_history")
+
+def ingest_bash_data():
+    if os.path.exists('dataset.json'):
+        print("Checking Bash dataset for RAG ingestion...")
+        with open('dataset.json', mode='r', encoding='utf-8') as file:
+            try:
+                data = json.load(file)
+                
+                # Skip ingestion if we already have the data to dramatically speed up startup
+                if collection.count() >= len(data):
+                    print("Dataset already ingested. Skipping ingestion to save time.")
+                    return
+                    
+                print(f"Ingesting {len(data)} items into ChromaDB. This may take a moment...")
+                docs = []
+                metadatas = []
+                ids = []
+                for index, row in enumerate(data):
+                    docs.append(row['prompt'])
+                    metadatas.append({"command": row['response']})
+                    ids.append(f"bash_dataset_{index}")
+                
+                # Use upsert to avoid crashing if IDs already exist! (Safety Fix)
+                collection.upsert(documents=docs, metadatas=metadatas, ids=ids)
+                print("Bash dataset loaded/updated successfully.")
+            except Exception as e:
+                print(f"Warning: Failed to ingest RAG data. Error: {e}")
 
 def get_system_context():
     os_name = platform.system()
@@ -24,52 +57,54 @@ def get_system_context():
     return f"OS: {os_name}, Shell: {shell_type}, CWD: {cwd}"
 
 def generate_command(user_input, context, history_context="", error_message=None, previous_cmd=None):
-    # Extract shell type from context
-    shell_type = "Windows Command Prompt (cmd.exe)" if "cmd.exe" in context else "Bash"
-    
-    prompt = f"""
-You are an expert systems administrator and terminal assistant. Convert the user request into a valid, up-to-date {shell_type} command.
+    system_prompt = f"""You are an expert Bash shell assistant. Convert the user request into a valid, up-to-date Bash command.
 
 CRITICAL RULES:
-1. ONLY output the raw command. 
-2. DO NOT include markdown code blocks (e.g., no ```powershell or ```).
+1. ONLY output the raw Bash command.
+2. DO NOT include markdown code blocks (e.g., no ```bash or ```).
 3. DO NOT include any explanations or conversational text.
-4. Use modern, widely-supported commands. Ensure valid syntax for {shell_type}.
+4. Only generate shell commands. If the user asks for something unrelated, output 'echo "Error: I only handle shell commands."'
 
 System Context:
-{context}
-"""
+{context}"""
+
+    user_prompt = ""
     if history_context:
-        prompt += f"\nRelevant Past Commands (RAG Context - use as reference if similar):\n{history_context}\n"
-    
+        user_prompt += f"Relevant Past Commands (RAG Context):\n{history_context}\n\n"
     if error_message and previous_cmd:
-        prompt += f"\nThe previous command `{previous_cmd}` failed with this error:\n{error_message}\nCarefully analyze the error and provide a CORRECTED command."
+        user_prompt += f"The previous command `{previous_cmd}` failed with this error:\n{error_message}\nCarefully analyze the error and provide a CORRECTED Bash command.\n\n"
     
-    prompt += f"\nUser Request: {user_input}"
-    
-    response = model.generate_content(prompt)
-    cmd = response.text.strip()
-    
-    # Fallback to strip markdown if the model hallucinates it despite instructions
-    cmd = cmd.replace("```powershell", "").replace("```bash", "").replace("```sh", "").replace("```", "").strip()
-    return cmd
+    user_prompt += f"User Request: {user_input}"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response = client.chat_completion(
+            messages=messages,
+            max_tokens=100,
+            temperature=0.1
+        )
+        cmd = response.choices[0].message.content.strip()
+        cmd = cmd.replace("```powershell", "").replace("```bash", "").replace("```sh", "").replace("```", "").strip()
+        return cmd
+    except Exception as e:
+        return f"echo 'Error generating command from Hugging Face: {e}'"
 
 def ai_shell():
-    print("AI Shell Initialized (with RAG & Agentic Auto-Correction). Type 'exit' to quit.")
+    ingest_bash_data()
+    print(f"\nBash AI Assistant Initialized (Powered by {MODEL_ID.split('/')[-1]}). Type 'exit' to quit.")
+    
     while True:
-        user_input = input("AI-Admin> ")
+        user_input = input("\nBash-Bot> ")
         if user_input.lower() in ['exit', 'quit']: break
         if not user_input.strip(): continue
         
         # 1. Retrieve RAG Context
-        # Querying the database for similar previous requests
-        results = collection.query(
-            query_texts=[user_input],
-            n_results=3
-        )
-        
+        results = collection.query(query_texts=[user_input], n_results=3)
         history_context = ""
-        # Format the RAG results if any exist
         if results and results.get('documents') and len(results['documents'][0]) > 0:
             history_context = "\n".join(
                 [f"- Request: '{req}', Command: '{meta['command']}'" 
@@ -79,44 +114,39 @@ def ai_shell():
         context = get_system_context()
         error_msg = None
         current_cmd = None
-        
-        # 2. Agentic Loop (Generate -> Execute -> Correct)
         max_retries = 3
         retry_count = 0
         
+        # 2. Agentic Loop
         while retry_count < max_retries:
+            print(f"Thinking...", end="\r")
             cmd = generate_command(user_input, context, history_context, error_msg, current_cmd)
             current_cmd = cmd
             
+            # --- SAFETY GATE ADDED HERE ---
+            print(f"\nProposed Command: \033[92m{cmd}\033[0m")
+            confirm = input("Execute this command? [y/N]: ")
+            if confirm.lower() != 'y':
+                print("Execution cancelled by user.")
+                break
+            # ------------------------------
+
             print(f"Executing: {cmd}")
-            # Execute command and capture output/error for agentic correction
-            process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            process = subprocess.run(cmd, shell=True)
             
-            # Print output to user
-            if process.stdout:
-                print(process.stdout)
-            
+            # 3. Success -> Store to Memory
             if process.returncode == 0:
-                # 3. Store Success in RAG
                 try:
                     doc_id = str(hash(user_input + cmd))
-                    # We only add if this specific interaction wasn't added before
-                    collection.add(
-                        documents=[user_input],
-                        metadatas=[{"command": cmd}],
-                        ids=[doc_id]
-                    )
-                    print("[Saved to RAG History]")
+                    collection.add(documents=[user_input], metadatas=[{"command": cmd}], ids=[doc_id])
                 except Exception as e:
-                    # Ignore exceptions like duplicate ID
-                    pass
-                break # Success, exit agentic loop
+                    # Added warning instead of silent pass
+                    pass 
+                break
+            # 4. Failure -> Retry Loop
             else:
-                print(f"Execution Failed (Exit Code: {process.returncode}):")
-                if process.stderr:
-                    print(process.stderr)
-                error_msg = process.stderr or "Unknown Error"
-                
+                print(f"\033[91mExecution Failed (Exit Code: {process.returncode}):\033[0m")
+                error_msg = f"Command failed with exit code {process.returncode}."
                 print("Attempting auto-correction...")
                 retry_count += 1
                 
