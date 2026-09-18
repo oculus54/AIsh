@@ -1,0 +1,5 @@
+nsformers
+peft
+accelerate
+sentencepiece
+safetensors
